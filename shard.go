@@ -152,31 +152,13 @@ func (s *Shard) open(path string, conn MessagingConn) error {
 	}
 
 	// Open store on shard.
-	store, err := bolt.Open(path, 0666, &bolt.Options{Timeout: 1 * time.Second})
-	if err != nil {
-		s.stats.Inc("errBoltOpenFailure")
+	if err := s.initializeStore(path); err != nil {
 		return err
 	}
-	s.store = store
 
-	// Initialize store.
-	if err := s.store.Update(func(tx *bolt.Tx) error {
-		_, _ = tx.CreateBucketIfNotExists([]byte("meta"))
-		_, _ = tx.CreateBucketIfNotExists([]byte("values"))
-
-		// Find highest replicated index.
-		s.index = shardMetaIndex(tx)
-
-		// Open connection.
-		if err := conn.Open(s.index, true); err != nil {
-			return fmt.Errorf("open shard conn: id=%d, idx=%d, err=%s", s.ID, s.index, err)
-		}
-
-		return nil
-	}); err != nil {
-		s.stats.Inc("errBoltStoreUpdateFailure")
-		_ = s.close()
-		return fmt.Errorf("init: %s", err)
+	// Initialize connection for streaming to shard.
+	if err := s.initializeConn(conn); err != nil {
+		return err
 	}
 
 	// Start importing from connection.
@@ -184,6 +166,46 @@ func (s *Shard) open(path string, conn MessagingConn) error {
 	s.wg.Add(1)
 	go s.processor(conn, s.closing)
 
+	return nil
+}
+
+// initializeStore opens the store. If it is already open, it is first closed.
+func (s *Shard) initializeStore(path string) error {
+	if s.store != nil {
+		if err := s.store.Close(); err != nil {
+			return err
+		}
+	}
+	store, err := bolt.Open(path, 0666, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		s.stats.Inc("errBoltOpenFailure")
+		return err
+	}
+	s.store = store
+	if err := s.store.Update(func(tx *bolt.Tx) error {
+		_, _ = tx.CreateBucketIfNotExists([]byte("meta"))
+		_, _ = tx.CreateBucketIfNotExists([]byte("values"))
+
+		// Find highest replicated index.
+		s.index = shardMetaIndex(tx)
+		return nil
+	}); err != nil {
+		s.stats.Inc("errBoltStoreUpdateFailure")
+		_ = s.close()
+		return fmt.Errorf("init: %s", err)
+	}
+	return nil
+}
+
+// initalizeConn correctly initializes the connection. If it is already open
+// it closes it first.
+func (s *Shard) initializeConn(conn MessagingConn) error {
+	_ = conn.Close()
+
+	// Open connection.
+	if err := conn.Open(s.index, true); err != nil {
+		return fmt.Errorf("open shard conn: id=%d, idx=%d, err=%s", s.ID, s.index, err)
+	}
 	return nil
 }
 
