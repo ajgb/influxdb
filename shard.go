@@ -4,7 +4,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -391,6 +394,50 @@ func (s *Shard) processor(conn MessagingConn, closing <-chan struct{}) {
 
 		// Handle write series separately so we don't lock server during shard writes.
 		switch m.Type {
+		case messaging.FetchPeerShardMessageType:
+			s.stats.Inc("FetchPeerShardMessageRx")
+			url := string(m.Data) + fmt.Sprintf("/data/shard/%d", s.ID)
+			resp, err := http.Get(url)
+			if err != nil {
+				return
+			}
+
+			// Check response & parse content length.
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			sz, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+			if err != nil {
+				return
+			}
+
+			// Close the store.
+			path := s.store.Path()
+			_ = s.store.Close()
+
+			// Overwrite the shard.
+			f, err := os.Create(path)
+			if err != nil {
+				return
+			}
+
+			// Copy and check size.
+			if _, err := io.CopyN(f, resp.Body, sz); err != nil {
+				_ = f.Close()
+				return
+			}
+			_ = f.Close()
+
+			// Reinitialize store and connection.
+			if err := s.initializeStore(path); err != nil {
+				return
+			}
+
+			// Re-initialize connection for streaming to shard.
+			if err := s.initializeConn(conn); err != nil {
+				return
+			}
+
 		case writeRawSeriesMessageType:
 			s.stats.Inc("writeSeriesMessageRx")
 			if err := s.writeSeries(m.Index, m.Data); err != nil {
